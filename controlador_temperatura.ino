@@ -1,15 +1,12 @@
 /*
-  Controlador de Temperatura com DHT22 e Matriz de LED (Controle Manual)
+  Controlador de Temperatura com DHT22 e Matriz de LED (Timer Interrupt)
 
-  Versão Final:
-  - Utiliza controle de baixo nível para a matriz de LED com shiftOut,
-    baseado no hardware específico do usuário.
-  - Não depende de bibliotecas externas para o display (LedControl, MD_Parola).
-  - Mantém a funcionalidade não-bloqueante para sensor e botões.
-
-  Lógica da Matriz (baseado no feedback do usuário):
-  - Primeiro byte enviado via shiftOut controla as LINHAS (LOW para ativar).
-  - Segundo byte enviado via shiftOut controla as COLUNAS (HIGH para ativar).
+  Versão Profissional:
+  - Utiliza uma interrupção de hardware (Timer1) para a atualização da matriz
+    de LED, eliminando qualquer oscilação (flicker).
+  - A imagem no display é perfeitamente estável, independente de outras
+    tarefas como a leitura do sensor.
+  - Mantém o controle manual de baixo nível via shiftOut.
 */
 
 // --- Bibliotecas ---
@@ -17,15 +14,13 @@
 #include <DHT.h>
 
 // --- Definições de Pinos ---
-#define DHT_PIN         5    // Pino de dados do sensor DHT22
-#define MOSFET_PIN      2    // Pino de controle do MOSFET
-#define UP_BUTTON_PIN   3    // Pino do botão de aumentar temperatura
-#define DOWN_BUTTON_PIN 4    // Pino do botão de reduzir temperatura
-
-// Pinos para a Matriz de LED (74HC595)
-#define DATA_PIN        11   // DS
-#define CLOCK_PIN       13   // SH_CP
-#define LATCH_PIN       10   // ST_CP
+#define DHT_PIN         5
+#define MOSFET_PIN      2
+#define UP_BUTTON_PIN   3
+#define DOWN_BUTTON_PIN 4
+#define DATA_PIN        11
+#define CLOCK_PIN       13
+#define LATCH_PIN       10
 
 // --- Constantes do Sistema ---
 #define DHTTYPE         DHT22
@@ -46,27 +41,26 @@ bool lastUpButtonState = LOW;
 bool lastDownButtonState = LOW;
 unsigned long lastDebounceTime = 0;
 
-// --- Lógica da Matriz de LED (Controle Manual) ---
-byte displayBuffer[8] = {0}; // 8 colunas, cada uma um byte para as linhas
-int currentColumn = 0;
-unsigned long lastDisplayRefresh = 0;
+// --- Lógica da Matriz de LED ---
+// Use 'volatile' para variáveis usadas dentro e fora de uma ISR
+volatile byte displayBuffer[8] = {0};
+volatile int currentColumn = 0;
 
-// Fonte de caracteres (5 pixels de altura, 3 de largura)
-// Os bits representam as linhas que devem estar ACESAS (HIGH)
+// Fonte de caracteres (ajustada para ficar um pouco mais para cima)
 const byte font[10][3] = {
-  { B01111110, B01000010, B01111110 }, // 0
-  { B00000010, B01111110, B00000000 }, // 1
-  { B01100100, B01010010, B01001100 }, // 2
-  { B01000100, B01010010, B01111100 }, // 3
-  { B00011000, B00010100, B01111110 }, // 4
-  { B01011110, B01010010, B01110010 }, // 5
-  { B01111100, B01010010, B01110000 }, // 6
-  { B00000110, B00000010, B01111110 }, // 7
-  { B01111110, B01001010, B01111110 }, // 8
-  { B01001110, B01001010, B01111110 }  // 9
+  { B00111110, B00100010, B00111110 }, // 0
+  { B00010000, B00111110, B00000000 }, // 1
+  { B00110010, B00101010, B00100100 }, // 2
+  { B00100010, B00101010, B00111100 }, // 3
+  { B00001100, B00001000, B00111110 }, // 4
+  { B00101110, B00101010, B00111010 }, // 5
+  { B00111100, B00101010, B00111000 }, // 6
+  { B00000110, B00000100, B00111100 }, // 7
+  { B00111110, B00101010, B00111110 }, // 8
+  { B00101110, B00101010, B00111110 }  // 9
 };
 
-// --- Funções Principais ---
+// --- Funções de Configuração ---
 
 void setup() {
   Serial.begin(9600);
@@ -81,107 +75,117 @@ void setup() {
 
   dht.begin();
   readSensor(); // Leitura inicial
+
+  setupTimer1(); // Configura a interrupção para o display
 }
 
-void loop() {
-  // Funções não-bloqueantes
-  handleButtons();
-  readSensor();
-  controlMosfet();
-  updateDisplay(); // Prepara o buffer
-  refreshDisplay(); // Desenha na tela (multiplexação)
+void setupTimer1() {
+  cli(); // Desabilita interrupções globais para configurar
+
+  // Configura o Timer1 para disparar a cada 1ms
+  TCCR1A = 0;
+  TCCR1B = 0;
+  TCNT1  = 0;
+
+  OCR1A = 1999; // Compare Match Register (16MHz/8/1000Hz - 1) = 1999
+  TCCR1B |= (1 << WGM12); // Modo CTC
+  TCCR1B |= (1 << CS11);  // Prescaler de 8
+
+  TIMSK1 |= (1 << OCIE1A); // Habilita a interrupção por comparação
+
+  sei(); // Habilita interrupções globais
 }
 
-// --- Funções de Controle da Matriz de LED ---
+// --- Rotina de Serviço de Interrupção (ISR) ---
+// Esta função é chamada AUTOMATICAMENTE pelo hardware a cada 1ms
 
-// Função que envia os bytes para os registradores
-void sendTo595(byte rowData, byte colData) {
+ISR(TIMER1_COMPA_vect) {
+  // Desliga todos os LEDs para evitar "ghosting"
   digitalWrite(LATCH_PIN, LOW);
-  // A lógica do hardware é: linhas são ativadas com LOW. Invertemos os bits.
+  shiftOut(DATA_PIN, CLOCK_PIN, MSBFIRST, 0xFF); // Todas as linhas OFF
+  shiftOut(DATA_PIN, CLOCK_PIN, MSBFIRST, 0x00); // Todas as colunas OFF
+  digitalWrite(LATCH_PIN, HIGH);
+
+  // Avança para a próxima coluna
+  currentColumn++;
+  if (currentColumn >= 8) {
+    currentColumn = 0;
+  }
+
+  // Ativa a coluna correta e envia os dados da linha
+  byte rowData = displayBuffer[currentColumn];
+  byte colData = 1 << (7 - currentColumn);
+
+  digitalWrite(LATCH_PIN, LOW);
   shiftOut(DATA_PIN, CLOCK_PIN, MSBFIRST, ~rowData);
   shiftOut(DATA_PIN, CLOCK_PIN, MSBFIRST, colData);
   digitalWrite(LATCH_PIN, HIGH);
 }
 
-// Prepara o que deve ser mostrado na tela
-void prepareDisplayBuffer(int number) {
-  // Limpa o buffer antigo
-  for (int i = 0; i < 8; i++) displayBuffer[i] = 0;
 
-  // Limita o número para o intervalo que podemos exibir (0-99)
+// --- Loop Principal ---
+
+void loop() {
+  handleButtons();
+  readSensor();
+  controlMosfet();
+  updateDisplay(); // Apenas prepara o buffer, não desenha
+}
+
+
+// --- Funções Auxiliares ---
+
+void prepareDisplayBuffer(int number) {
+  byte tempBuffer[8] = {0}; // Buffer temporário
+
   if (number > 99) number = 99;
-  if (number < 0) number = 0; // Simplificado para não exibir negativos
+  if (number < 0) number = 0;
 
   if (number >= 10) {
     int tens = number / 10;
     int ones = number % 10;
-    // Dígito da dezena (colunas 1, 2, 3)
-    for (int i = 0; i < 3; i++) displayBuffer[i+1] = font[tens][i];
-    // Dígito da unidade (colunas 5, 6, 7)
-    for (int i = 0; i < 3; i++) displayBuffer[i + 5] = font[ones][i];
+    for (int i = 0; i < 3; i++) tempBuffer[i+1] = font[tens][i];
+    for (int i = 0; i < 3; i++) tempBuffer[i+5] = font[ones][i];
   } else {
     int ones = number % 10;
-    // Dígito único, centralizado (colunas 2, 3, 4)
-    for (int i = 0; i < 3; i++) displayBuffer[i + 2] = font[ones][i];
+    for (int i = 0; i < 3; i++) tempBuffer[i+2] = font[ones][i];
   }
-}
 
-// Atualiza uma coluna da matriz (deve ser chamada constantemente)
-void refreshDisplay() {
-  // A varredura de colunas deve ser rápida. 2ms por coluna está ótimo.
-  if (millis() - lastDisplayRefresh > 2) {
-    lastDisplayRefresh = millis();
-
-    // Desliga todos os LEDs para evitar "ghosting"
-    sendTo595(B00000000, B00000000);
-
-    // Pega os dados da coluna atual
-    byte rowData = displayBuffer[currentColumn];
-    // Ativa apenas a coluna atual
-    byte colData = 1 << (7 - currentColumn);
-
-    sendTo595(rowData, colData);
-
-    // Avança para a próxima coluna
-    currentColumn++;
-    if (currentColumn >= 8) {
-      currentColumn = 0;
-    }
+  // Copia os dados para o buffer volátil de forma segura
+  noInterrupts(); // Desabilita interrupções para a cópia
+  for (int i=0; i<8; i++) {
+    displayBuffer[i] = tempBuffer[i];
   }
+  interrupts(); // Reabilita interrupções
 }
-
-// --- Funções do Sistema ---
 
 void updateDisplay() {
   if (displayShowsSetTemp && (millis() - lastInteractionTime > DISPLAY_TIMEOUT)) {
     displayShowsSetTemp = false;
   }
-
   int tempToDisplay = displayShowsSetTemp ? userSetTemperature : round(currentTemperature);
   prepareDisplayBuffer(tempToDisplay);
 }
 
 void handleButtons() {
   if ((millis() - lastDebounceTime) > DEBOUNCE_DELAY) {
-    bool upButtonState = digitalRead(UP_BUTTON_PIN);
-    bool downButtonState = digitalRead(DOWN_BUTTON_PIN);
+    bool upState = digitalRead(UP_BUTTON_PIN);
+    bool downState = digitalRead(DOWN_BUTTON_PIN);
 
-    if (upButtonState != lastUpButtonState && upButtonState == HIGH) {
+    if (upState != lastUpButtonState && upState == HIGH) {
       userSetTemperature++;
       lastInteractionTime = millis();
       displayShowsSetTemp = true;
       lastDebounceTime = millis();
     }
-
-    if (downButtonState != lastDownButtonState && downButtonState == HIGH) {
+    if (downState != lastDownButtonState && downState == HIGH) {
       userSetTemperature--;
       lastInteractionTime = millis();
       displayShowsSetTemp = true;
       lastDebounceTime = millis();
     }
-
-    lastUpButtonState = upButtonState;
-    lastDownButtonState = downButtonState;
+    lastUpButtonState = upState;
+    lastDownButtonState = downState;
   }
 }
 
