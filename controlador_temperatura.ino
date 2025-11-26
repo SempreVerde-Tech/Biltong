@@ -1,144 +1,183 @@
 /*
-  Controlador de Temperatura com DHT22, Botões Touch, MOSFET e Matriz de LED 8x8
+  Controlador de Temperatura com DHT22 e Matriz de LED (Controle Manual)
 
-  Funcionalidades:
-  - Lê dados de umidade e temperatura do sensor DHT22.
-  - Permite ao usuário configurar uma temperatura desejada usando dois botões touch.
-  - Ativa um módulo MOSFET se a temperatura atual for menor que a configurada.
-  - Exibe a temperatura atual ou a temperatura configurada em uma matriz de LED 8x8.
-  - O código é não-bloqueante, usando millis() para um funcionamento responsivo.
+  Versão Final:
+  - Utiliza controle de baixo nível para a matriz de LED com shiftOut,
+    baseado no hardware específico do usuário.
+  - Não depende de bibliotecas externas para o display (LedControl, MD_Parola).
+  - Mantém a funcionalidade não-bloqueante para sensor e botões.
 
-  Conexões:
-  - Sensor DHT22: Pino D5
-  - Módulo MOSFET: Pino D2
-  - Botão Touch (Aumentar): Pino D3
-  - Botão Touch (Reduzir): Pino D4
-  - Matriz de LED (via 74HC595):
-    - DI (Data In): Pino 11
-    - CLK (Clock): Pino 13
-    - LAT (Latch / CS): Pino 10
+  Lógica da Matriz (baseado no feedback do usuário):
+  - Primeiro byte enviado via shiftOut controla as LINHAS (LOW para ativar).
+  - Segundo byte enviado via shiftOut controla as COLUNAS (HIGH para ativar).
 */
 
-// --- Inclusão das Bibliotecas ---
+// --- Bibliotecas ---
 #include <Adafruit_Sensor.h>
 #include <DHT.h>
-#include <LedControl.h>
 
 // --- Definições de Pinos ---
-#define DHT_PIN      5         // Pino de dados do sensor DHT22
-#define MOSFET_PIN   2         // Pino de controle do MOSFET
-#define UP_BUTTON_PIN 3        // Pino do botão de aumentar temperatura
-#define DOWN_BUTTON_PIN 4      // Pino do botão de reduzir temperatura
+#define DHT_PIN         5    // Pino de dados do sensor DHT22
+#define MOSFET_PIN      2    // Pino de controle do MOSFET
+#define UP_BUTTON_PIN   3    // Pino do botão de aumentar temperatura
+#define DOWN_BUTTON_PIN 4    // Pino do botão de reduzir temperatura
 
-// Pinos para o controlador da Matriz de LED (74HC595)
-#define DI_PIN       11        // Data In
-#define CLK_PIN      13        // Clock
-#define LAT_PIN      10        // Latch
+// Pinos para a Matriz de LED (74HC595)
+#define DATA_PIN        11   // DS
+#define CLOCK_PIN       13   // SH_CP
+#define LATCH_PIN       10   // ST_CP
 
 // --- Constantes do Sistema ---
-#define DHTTYPE      DHT22     // Define o tipo do sensor como DHT22
-#define SENSOR_READ_INTERVAL 2000 // Intervalo para ler o sensor (2 segundos), o DHT22 é lento
-#define DISPLAY_TIMEOUT 10000     // Tempo para a matriz voltar a exibir a temp. atual (10 segundos)
-#define DEBOUNCE_DELAY 50         // Atraso para "debounce" dos botões (50 ms)
+#define DHTTYPE         DHT22
+#define SENSOR_READ_INTERVAL 2000
+#define DISPLAY_TIMEOUT 10000
+#define DEBOUNCE_DELAY  50
 
 // --- Instanciação dos Objetos ---
 DHT dht(DHT_PIN, DHTTYPE);
-// LedControl(dataPin, clockPin, csPin, numDevices)
-LedControl lc = LedControl(DI_PIN, CLK_PIN, LAT_PIN, 1); // 1 dispositivo (a matriz 8x8)
 
 // --- Variáveis Globais ---
 float currentTemperature = 0.0;
-float currentHumidity = 0.0;
-int userSetTemperature = 25; // Temperatura alvo inicial (ex: 25°C)
-
-// Variáveis para controle do display
+int userSetTemperature = 25;
 bool displayShowsSetTemp = false;
 unsigned long lastInteractionTime = 0;
-
-// Variáveis para leitura do sensor
 unsigned long lastSensorReadTime = 0;
-
-// Variáveis para debounce dos botões
 bool lastUpButtonState = LOW;
 bool lastDownButtonState = LOW;
 unsigned long lastDebounceTime = 0;
 
-// --- Mapa de bits para exibir números de 0 a 9 e o sinal de menos ---
-const byte font[10][4] = {
-  {B0110, B1001, B1001, B0110}, // 0
-  {B0010, B0110, B0010, B0010}, // 1
-  {B0110, B0001, B0010, B0111}, // 2
-  {B0110, B0001, B0110, B0001}, // 3
-  {B1001, B1001, B1111, B0001}, // 4
-  {B1111, B1000, B0110, B0001}, // 5
-  {B0110, B1000, B1011, B0100}, // 6
-  {B1111, B0001, B0010, B0100}, // 7
-  {B0110, B1001, B0110, B1001}, // 8
-  {B0010, B1001, B0111, B0001}  // 9
-};
-const byte font_minus[4] = {
-  B0000, B0110, B0110, B0000 // Caractere para o sinal '-'
+// --- Lógica da Matriz de LED (Controle Manual) ---
+byte displayBuffer[8] = {0}; // 8 colunas, cada uma um byte para as linhas
+int currentColumn = 0;
+unsigned long lastDisplayRefresh = 0;
+
+// Fonte de caracteres (5 pixels de altura, 3 de largura)
+// Os bits representam as linhas que devem estar ACESAS (HIGH)
+const byte font[10][3] = {
+  { B01111110, B01000010, B01111110 }, // 0
+  { B0010000, B0111111, B0010000 }, // 1
+  { B0110010, B0101001, B0100110 }, // 2
+  { B0100010, B0101001, B0111110 }, // 3
+  { B0001100, B0001010, B0111111 }, // 4
+  { B0101111, B0101001, B0111001 }, // 5
+  { B0111110, B0101001, B0111000 }, // 6
+  { B0000011, B0000100, B0111100 }, // 7
+  { B0111110, B0101001, B0111110 }, // 8
+  { B0001110, B0101001, B0111110 }  // 9
 };
 
+// --- Funções Principais ---
 
 void setup() {
   Serial.begin(9600);
-  Serial.println("Iniciando o sistema de controle de temperatura...");
-
-  // Configuração dos pinos
   pinMode(MOSFET_PIN, OUTPUT);
   pinMode(UP_BUTTON_PIN, INPUT);
   pinMode(DOWN_BUTTON_PIN, INPUT);
-  digitalWrite(MOSFET_PIN, LOW); // Garante que o MOSFET comece desligado
+  digitalWrite(MOSFET_PIN, LOW);
 
-  // Inicialização do sensor
+  pinMode(DATA_PIN, OUTPUT);
+  pinMode(CLOCK_PIN, OUTPUT);
+  pinMode(LATCH_PIN, OUTPUT);
+
   dht.begin();
-
-  // Inicialização da Matriz de LED
-  lc.shutdown(0, false);      // Acorda o display
-  lc.setIntensity(0, 8);      // Define o brilho (0-15)
-  lc.clearDisplay(0);         // Limpa o display
-
-  // Faz uma leitura inicial para ter um valor para exibir
-  readSensor();
-  updateDisplay();
+  readSensor(); // Leitura inicial
 }
 
 void loop() {
-  // Funções principais que rodam continuamente de forma não-bloqueante
+  // Funções não-bloqueantes
   handleButtons();
   readSensor();
   controlMosfet();
-  updateDisplay();
+  updateDisplay(); // Prepara o buffer
+  refreshDisplay(); // Desenha na tela (multiplexação)
 }
 
-/**
- * @brief Lê os botões com debounce para evitar leituras múltiplas.
- */
+// --- Funções de Controle da Matriz de LED ---
+
+// Função que envia os bytes para os registradores
+void sendTo595(byte rowData, byte colData) {
+  digitalWrite(LATCH_PIN, LOW);
+  // A lógica do hardware é: linhas são ativadas com LOW. Invertemos os bits.
+  shiftOut(DATA_PIN, CLOCK_PIN, MSBFIRST, ~rowData);
+  shiftOut(DATA_PIN, CLOCK_PIN, MSBFIRST, colData);
+  digitalWrite(LATCH_PIN, HIGH);
+}
+
+// Prepara o que deve ser mostrado na tela
+void prepareDisplayBuffer(int number) {
+  // Limpa o buffer antigo
+  for (int i = 0; i < 8; i++) displayBuffer[i] = 0;
+
+  // Limita o número para o intervalo que podemos exibir (0-99)
+  if (number > 99) number = 99;
+  if (number < 0) number = 0; // Simplificado para não exibir negativos
+
+  if (number >= 10) {
+    int tens = number / 10;
+    int ones = number % 10;
+    // Dígito da dezena (colunas 0, 1, 2)
+    for (int i = 0; i < 3; i++) displayBuffer[i] = font[tens][i];
+    // Dígito da unidade (colunas 4, 5, 6)
+    for (int i = 0; i < 3; i++) displayBuffer[i + 4] = font[ones][i];
+  } else {
+    int ones = number % 10;
+    // Dígito único, centralizado (colunas 2, 3, 4)
+    for (int i = 0; i < 3; i++) displayBuffer[i + 2] = font[ones][i];
+  }
+}
+
+// Atualiza uma coluna da matriz (deve ser chamada constantemente)
+void refreshDisplay() {
+  // A varredura de colunas deve ser rápida. 2ms por coluna está ótimo.
+  if (millis() - lastDisplayRefresh > 2) {
+    lastDisplayRefresh = millis();
+
+    // Desliga todos os LEDs para evitar "ghosting"
+    sendTo595(B00000000, B00000000);
+
+    // Pega os dados da coluna atual
+    byte rowData = displayBuffer[currentColumn];
+    // Ativa apenas a coluna atual
+    byte colData = 1 << (7 - currentColumn);
+
+    sendTo595(rowData, colData);
+
+    // Avança para a próxima coluna
+    currentColumn++;
+    if (currentColumn >= 8) {
+      currentColumn = 0;
+    }
+  }
+}
+
+// --- Funções do Sistema ---
+
+void updateDisplay() {
+  if (displayShowsSetTemp && (millis() - lastInteractionTime > DISPLAY_TIMEOUT)) {
+    displayShowsSetTemp = false;
+  }
+
+  int tempToDisplay = displayShowsSetTemp ? userSetTemperature : round(currentTemperature);
+  prepareDisplayBuffer(tempToDisplay);
+}
+
 void handleButtons() {
-  // Verifica se passou tempo suficiente desde o último toque para o debounce
   if ((millis() - lastDebounceTime) > DEBOUNCE_DELAY) {
     bool upButtonState = digitalRead(UP_BUTTON_PIN);
     bool downButtonState = digitalRead(DOWN_BUTTON_PIN);
 
-    // Lógica para o botão de AUMENTAR
     if (upButtonState != lastUpButtonState && upButtonState == HIGH) {
       userSetTemperature++;
       lastInteractionTime = millis();
       displayShowsSetTemp = true;
-      Serial.print("Temperatura configurada: ");
-      Serial.println(userSetTemperature);
-      lastDebounceTime = millis(); // Reseta o timer do debounce
+      lastDebounceTime = millis();
     }
 
-    // Lógica para o botão de REDUZIR
     if (downButtonState != lastDownButtonState && downButtonState == HIGH) {
       userSetTemperature--;
       lastInteractionTime = millis();
       displayShowsSetTemp = true;
-      Serial.print("Temperatura configurada: ");
-      Serial.println(userSetTemperature);
-      lastDebounceTime = millis(); // Reseta o timer do debounce
+      lastDebounceTime = millis();
     }
 
     lastUpButtonState = upButtonState;
@@ -146,99 +185,20 @@ void handleButtons() {
   }
 }
 
-/**
- * @brief Lê a temperatura e umidade do sensor em intervalos definidos.
- */
 void readSensor() {
-  // A leitura só ocorre se o intervalo de tempo for atingido
   if (millis() - lastSensorReadTime >= SENSOR_READ_INTERVAL) {
-    lastSensorReadTime = millis(); // Atualiza o tempo da última leitura
-
-    float h = dht.readHumidity();
+    lastSensorReadTime = millis();
     float t = dht.readTemperature();
-
-    // Verifica se a leitura falhou (retorna NaN - Not a Number)
-    if (isnan(h) || isnan(t)) {
-      Serial.println("Falha ao ler o sensor DHT!");
-      return;
+    if (!isnan(t)) {
+      currentTemperature = t;
     }
-
-    currentTemperature = t;
-    currentHumidity = h;
-
-    Serial.print(F("Umidade: "));
-    Serial.print(currentHumidity);
-    Serial.print(F("%  Temperatura: "));
-    Serial.print(currentTemperature);
-    Serial.println(F("°C"));
   }
 }
 
-/**
- * @brief Ativa ou desativa o MOSFET com base na comparação das temperaturas.
- */
 void controlMosfet() {
-  // Se a temperatura lida for válida (diferente de 0) e menor que a configurada
   if (currentTemperature > 0 && currentTemperature < userSetTemperature) {
-    digitalWrite(MOSFET_PIN, HIGH); // Ativa o MOSFET
+    digitalWrite(MOSFET_PIN, HIGH);
   } else {
-    digitalWrite(MOSFET_PIN, LOW);  // Desativa o MOSFET
-  }
-}
-
-/**
- * @brief Gerencia o que é exibido na matriz de LED.
- */
-void updateDisplay() {
-  // Se o display está mostrando a temperatura configurada, verifica o timeout
-  if (displayShowsSetTemp && (millis() - lastInteractionTime > DISPLAY_TIMEOUT)) {
-    displayShowsSetTemp = false; // Volta a mostrar a temperatura atual
-  }
-
-  int tempToDisplay;
-  if (displayShowsSetTemp) {
-    tempToDisplay = userSetTemperature;
-  } else {
-    tempToDisplay = round(currentTemperature); // Arredonda para o inteiro mais próximo
-  }
-
-  // Chama a função para efetivamente "desenhar" o número na matriz
-  displayNumber(tempToDisplay);
-}
-
-/**
- * @brief Exibe um número de até 2 dígitos na matriz 8x8. Remove a função getRow() que causava erro.
- * @param number O número a ser exibido.
- */
-void displayNumber(int number) {
-  lc.clearDisplay(0);
-
-  // Limita o número para o intervalo que podemos exibir (-9 a 99)
-  if (number > 99) number = 99;
-  if (number < -9) number = -9;
-
-  if (number >= 10) {
-    // --- Número de dois dígitos (10-99) ---
-    int tens = number / 10;
-    int ones = number % 10;
-    for (int i = 0; i < 4; i++) {
-      byte row_data = (font[tens][i] << 4) | (font[ones][i]);
-      lc.setRow(0, i + 2, row_data);
-    }
-  } else if (number >= 0) {
-    // --- Número de um dígito (0-9) ---
-    int ones = number % 10;
-    // Centraliza o dígito deslocando 2 bits para a esquerda
-    for (int i = 0; i < 4; i++) {
-        lc.setRow(0, i + 2, font[ones][i] << 2);
-    }
-  } else {
-    // --- Número negativo (-9 a -1) ---
-    int ones = abs(number) % 10;
-    // Combina o caractere de menos (à esquerda) com o dígito (à direita)
-    for (int i = 0; i < 4; i++) {
-        byte row_data = (font_minus[i] << 4) | (font[ones][i]);
-        lc.setRow(0, i + 2, row_data);
-    }
+    digitalWrite(MOSFET_PIN, LOW);
   }
 }
