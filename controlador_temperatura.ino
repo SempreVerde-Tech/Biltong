@@ -115,10 +115,10 @@ void prepareDisplayBuffer(int number) {
   if (number >= 10) {
     int tens = number / 10;
     int ones = number % 10;
-    // Dígito da dezena (colunas 0, 1, 2)
-    for (int i = 0; i < 3; i++) displayBuffer[i] = font[tens][i];
-    // Dígito da unidade (colunas 4, 5, 6)
-    for (int i = 0; i < 3; i++) displayBuffer[i + 4] = font[ones][i];
+    // Dígito da dezena (colunas 1, 2, 3)
+    for (int i = 0; i < 3; i++) displayBuffer[i+1] = font[tens][i];
+    // Dígito da unidade (colunas 5, 6, 7)
+    for (int i = 0; i < 3; i++) displayBuffer[i + 5] = font[ones][i];
   } else {
     int ones = number % 10;
     // Dígito único, centralizado (colunas 2, 3, 4)
